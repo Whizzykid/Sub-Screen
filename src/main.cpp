@@ -1,18 +1,173 @@
+// main.cpp – starter template for ESP32‑8048S043C (4.3” 800×480 RGB) 
+// GUI: LVGL • Image viewer (SD) + WLED controller
+//
+// ───────────────────────────────────────────────
+// Dependencies (PlatformIO → Home → Libraries → +Add):
+//   lvgl
+//   ESP32_Display_Panel        (brings ESP_Panel_Library)
+//   ArduinoJson
+//   JPEGDecoder
+//
+// Board in platformio.ini must be:
+//   board = esp32-8048S043C
+// which auto‑defines all GPIO & timing macros (see boards JSON).
+//
+// Wi‑Fi credentials and WLED host can be overridden in platformio.ini:
+//   build_flags = -D WIFI_SSID="\"MyWiFi\"" -D WIFI_PASS="\"secret\"" -D WLED_HOST="\"wled.local\""
+// ───────────────────────────────────────────────
+
 #include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SD_MMC.h>
+#include <lvgl.h>
+#include <ArduinoJson.h>
+#include <JPEGDecoder.h>
+#include <ESP_Panel_Library.h>
+#include <vector>
 
-// put function declarations here:
-int myFunction(int, int);
+#ifndef WIFI_SSID
+#define WIFI_SSID "changeme"
+#define WIFI_PASS "changeme"
+#endif
 
+#ifndef WLED_HOST
+#define WLED_HOST "wled.local"
+#endif
+
+// ────────────────────────── Globals
+static ESP_Panel *panel;
+static lv_obj_t  *home_scr, *img_scr, *led_scr;
+static lv_obj_t  *img_obj;
+static std::vector<String> images;
+static size_t img_index = 0;
+
+// ────────────────────────── Wi‑Fi
+void wifi_connect() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+  }
+}
+
+// ────────────────────────── SD
+void sd_init() {
+  // pins TF_SPI_* and TF_CS come from the board JSON
+  SD_MMC.setPins(TF_SPI_MOSI, TF_SPI_MISO, TF_SPI_SCLK, TF_CS);
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("[SD] mount failed");
+  }
+}
+
+void scan_sd() {
+  images.clear();
+  File root = SD_MMC.open("/");
+  while (true) {
+    File f = root.openNextFile();
+    if (!f) break;
+    String n = f.name(); n.toLowerCase();
+    if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".bmp")) {
+      images.push_back(String("/") + f.name());
+    }
+    f.close();
+  }
+}
+
+// ────────────────────────── WLED helper
+void send_to_wled(const JsonDocument &doc) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(String("http://") + WLED_HOST + "/json/state");
+  http.addHeader("Content-Type", "application/json");
+  String payload; serializeJson(doc, payload);
+  http.POST(payload);
+  http.end();
+}
+
+// ────────────────────────── LVGL helpers
+void show_image() {
+  if (images.empty()) return;
+  lv_img_set_src(img_obj, images[img_index].c_str());
+}
+
+static void next_cb(lv_event_t *e) { if (++img_index >= images.size()) img_index = 0;  show_image(); }
+static void prev_cb(lv_event_t *e) { if (img_index == 0) img_index = images.size(); img_index--; show_image(); }
+static void slider_cb(lv_event_t *e) {
+  lv_obj_t *s = lv_event_get_target(e);
+  uint8_t bri = lv_slider_get_value(s);
+  StaticJsonDocument<64> doc; doc["bri"] = bri; send_to_wled(doc);
+}
+static void color_cb(lv_event_t *e) {
+  lv_color32_t c = lv_colorwheel_get_rgb32(lv_event_get_target(e));
+  StaticJsonDocument<128> doc;
+  JsonArray col = doc["seg"].createNestedArray().createNestedArray();
+  col.add(c.ch.red); col.add(c.ch.green); col.add(c.ch.blue);
+  send_to_wled(doc);
+}
+static void to_home(lv_event_t*, lv_event_code_t) { lv_scr_load(home_scr); }
+static void to_imgs(lv_event_t*, lv_event_code_t) { lv_scr_load(img_scr); }
+static void to_leds(lv_event_t*, lv_event_code_t) { lv_scr_load(led_scr); }
+
+// ────────────────────────── Build UI
+void build_ui() {
+  // Home
+  home_scr = lv_obj_create(NULL);
+  lv_obj_t *btn_img = lv_btn_create(home_scr);
+  lv_obj_center(btn_img);
+  lv_obj_add_event_cb(btn_img, to_imgs, LV_EVENT_CLICKED, NULL);
+  lv_label_set_text(lv_label_create(btn_img), "Images");
+
+  lv_obj_t *btn_led = lv_btn_create(home_scr);
+  lv_obj_align(btn_led, LV_ALIGN_CENTER, 0, 60);
+  lv_obj_add_event_cb(btn_led, to_leds, LV_EVENT_CLICKED, NULL);
+  lv_label_set_text(lv_label_create(btn_led), "LEDs");
+
+  // Images screen
+  img_scr = lv_obj_create(NULL);
+  img_obj = lv_img_create(img_scr);
+  lv_obj_center(img_obj);
+  auto nav = [&](const char* txt, lv_coord_t xOfs, lv_event_cb_t cb){
+    lv_obj_t *b = lv_btn_create(img_scr);
+    lv_obj_align(b, LV_ALIGN_CENTER, xOfs, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(lv_label_create(b), txt);
+  };
+  nav("<", -150, prev_cb); nav(">", 150, next_cb);
+  lv_obj_t *back1 = lv_btn_create(img_scr); lv_obj_align(back1, LV_ALIGN_TOP_LEFT, 10, 10);
+  lv_obj_add_event_cb(back1, to_home, LV_EVENT_CLICKED, NULL);
+  lv_label_set_text(lv_label_create(back1), "Home");
+
+  // LED screen
+  led_scr = lv_obj_create(NULL);
+  lv_obj_t *slider = lv_slider_create(led_scr); lv_obj_set_width(slider, 300);
+  lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, 40); lv_obj_add_event_cb(slider, slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_t *cw = lv_colorwheel_create(led_scr, true); lv_obj_align(cw, LV_ALIGN_CENTER, 0, 20);
+  lv_obj_add_event_cb(cw, color_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_t *back2 = lv_btn_create(led_scr); lv_obj_align(back2, LV_ALIGN_TOP_LEFT, 10, 10);
+  lv_obj_add_event_cb(back2, to_home, LV_EVENT_CLICKED, NULL);
+  lv_label_set_text(lv_label_create(back2), "Home");
+
+  lv_scr_load(home_scr);
+}
+
+// ────────────────────────── Panel & LVGL init (relies on board macros) 
+void panel_init() {
+  panel = new ESP_Panel();          // picks up DISPLAY_* and GPIO_* macros
+  panel->begin();
+  panel->initLVGL();                // registers LVGL flush + touch driver
+  lv_disp_set_rotation(panel->getLvglDisplay(), LV_DISP_ROT_NONE);
+}
+
+// ────────────────────────── Arduino entrypoints
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+  Serial.begin(115200);
+  pinMode(GPIO_BCKL, OUTPUT); digitalWrite(GPIO_BCKL, HIGH);
+  wifi_connect();
+  sd_init(); scan_sd();
+  panel_init(); build_ui(); show_image();
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-}
-
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+  lv_timer_handler();
+  delay(5);
 }
