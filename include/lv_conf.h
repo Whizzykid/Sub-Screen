@@ -1125,3 +1125,4 @@
 #endif /*LV_CONF_H*/
 
 #endif /*End of "Content enable"*/
+#define LV_USE_COLORWHEEL 1
